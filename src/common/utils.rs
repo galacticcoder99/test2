@@ -1,22 +1,25 @@
 use anyhow::Result;
-use borsh::{BorshDeserialize, BorshSerialize};
+use ethers::core::rand::thread_rng;
+use ethers::prelude::*;
+use ethers::{
+    self,
+    types::{
+        transaction::eip2930::{AccessList, AccessListItem},
+        U256,
+    },
+};
 use fern::colors::{Color, ColoredLevelConfig};
-use log::{info, LevelFilter};
-use solana_program::pubkey::Pubkey;
-use solana_sdk::bs58;
-use core::mem;
-use std::{collections::HashMap, fs::{File, OpenOptions}};
-use thiserror::Error;
-use reqwest::Error;
-use std::io::{BufWriter, Write};
+use foundry_evm_mini::evm::utils::{b160_to_h160, h160_to_b160, ru256_to_u256, u256_to_ru256};
+use log::LevelFilter;
+use rand::Rng;
+use revm::primitives::{B160, U256 as rU256};
+use std::str::FromStr;
+use std::sync::Arc;
 
-use crate::{arbitrage::types::{SwapPathResult, TokenInArb, TokenInfos}, common::constants::{
-    Env, PROJECT_NAME
-}};
-use solana_client::rpc_client::RpcClient;
+use crate::common::constants::{PROJECT_NAME, WETH};
 
 // Function to format our console logs
-pub fn setup_logger() -> Result<(), fern::InitError> {
+pub fn setup_logger() -> Result<()> {
     let colors = ColoredLevelConfig {
         trace: Color::Cyan,
         debug: Color::Magenta,
@@ -26,10 +29,7 @@ pub fn setup_logger() -> Result<(), fern::InitError> {
         ..ColoredLevelConfig::new()
     };
 
-    let mut base_config = fern::Dispatch::new();
-
-    //Console out
-    let stdout_config = fern::Dispatch::new()
+    fern::Dispatch::new()
         .format(move |out, message, record| {
             out.finish(format_args!(
                 "{}[{}] {}",
@@ -40,131 +40,117 @@ pub fn setup_logger() -> Result<(), fern::InitError> {
         })
         .chain(std::io::stdout())
         .level(log::LevelFilter::Error)
-        .level_for(PROJECT_NAME, LevelFilter::Info);
-    
-    //File logs
-    let file_config = fern::Dispatch::new()
-        .format(move |out, message, record| {
-            out.finish(format_args!(
-                "{}{} [{}][{}] {}",
-                chrono::Local::now().format("[%H:%M:%S]"),
-                chrono::Local::now().format("[%d/%m/%Y]"),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
-        .chain(fern::log_file("logs\\program.log")?)
-        .level(log::LevelFilter::Error)
-        .level_for(PROJECT_NAME, LevelFilter::Info);
-    //Errors logs
-    let errors_config = fern::Dispatch::new()
-        .format(move |out, message, record| {
-            out.finish(format_args!(
-                "{}{} [{}][{}] {}",
-                chrono::Local::now().format("[%H:%M:%S]"),
-                chrono::Local::now().format("[%d/%m/%Y]"),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
-        .chain(fern::log_file("logs\\errors.log")?)
-        .level(log::LevelFilter::Error);
-
-    base_config
-        .chain(file_config)
-        .chain(errors_config)
-        .chain(stdout_config)
+        .level_for(PROJECT_NAME, LevelFilter::Info)
         .apply()?;
-    Ok(())
-}
-
-pub fn write_file_swap_path_result(path: String, content_raw: SwapPathResult) -> Result<()> {
-    File::create(path.clone());
-
-    let file = OpenOptions::new().read(true).write(true).open(path.clone())?;
-    let mut writer = BufWriter::new(&file);
-
-    writer.write_all(serde_json::to_string(&content_raw)?.as_bytes())?;
-    writer.flush()?;
-    info!("Data written to '{}' successfully.", path);
 
     Ok(())
 }
 
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum ParsePubkeyError {
-    #[error("String is the wrong size")]
-    WrongSize,
-    #[error("Invalid Base58 string")]
-    Invalid,
-}
+// Calculates the next block base fee given the previous block's gas usage / limits
+// Refer to: https://www.blocknative.com/blog/eip-1559-fees
+pub fn calculate_next_block_base_fee(
+    gas_used: U256,
+    gas_limit: U256,
+    base_fee_per_gas: U256,
+) -> U256 {
+    let gas_used = gas_used;
 
-type Err = ParsePubkeyError;
-
-/// Maximum string length of a base58 encoded pubkey
-const MAX_BASE58_LEN: usize = 44;
-
-pub fn from_str(s: &str) -> Result<Pubkey, Err> {
-    if s.len() > MAX_BASE58_LEN {
-        return Err(ParsePubkeyError::WrongSize);
-    }
-    let pubkey_vec = bs58::decode(s)
-        .into_vec()
-        .map_err(|_| ParsePubkeyError::Invalid)?;
-    if pubkey_vec.len() != mem::size_of::<Pubkey>() {
-        Err(ParsePubkeyError::WrongSize)
+    let mut target_gas_used = gas_limit / 2;
+    target_gas_used = if target_gas_used == U256::zero() {
+        U256::one()
     } else {
-        Pubkey::try_from(pubkey_vec).map_err(|_| ParsePubkeyError::Invalid)
-    }
-}
-pub fn from_Pubkey(pubkey: Pubkey) -> String {
-    let pubkey_vec = bs58::encode(pubkey)
-        .into_string();
-    return pubkey_vec;
-}
+        target_gas_used
+    };
 
-pub async fn get_tokens_infos(tokens: Vec<TokenInArb>) -> HashMap<String, TokenInfos> {
-    let env = Env::new();
-    let rpc_client = RpcClient::new(env.rpc_url);
+    let new_base_fee = {
+        if gas_used > target_gas_used {
+            base_fee_per_gas
+                + ((base_fee_per_gas * (gas_used - target_gas_used)) / target_gas_used)
+                    / U256::from(8u64)
+        } else {
+            base_fee_per_gas
+                - ((base_fee_per_gas * (target_gas_used - gas_used)) / target_gas_used)
+                    / U256::from(8u64)
+        }
+    };
 
-    let mut pubkeys_str: Vec<String> = Vec::new();
-    let mut pubkeys: Vec<Pubkey> = Vec::new();
-    for token in tokens.clone() {
-        pubkeys_str.push(token.address.clone());
-        pubkeys.push(from_str(token.address.clone().as_str()).unwrap());
-    }
-    let batch_results = rpc_client.get_multiple_accounts(&pubkeys).unwrap();
-
-    let mut tokens_infos: HashMap<String, TokenInfos> = HashMap::new();
-
-    for (j, account) in batch_results.iter().enumerate() {
-        let account = account.clone().unwrap();
-        let mint_layout = MintLayout::try_from_slice(&account.data).unwrap();
-
-        let symbol = tokens.iter().find(|r| *r.address == pubkeys_str[j]).expect("Symbol token not found");
-        tokens_infos.insert(pubkeys_str[j].clone(), TokenInfos{
-            address: pubkeys_str[j].clone(),
-            decimals: mint_layout.decimals,
-            symbol: symbol.clone().symbol
-        });
-    }
-    return tokens_infos;
-
+    let seed = rand::thread_rng().gen_range(0..9);
+    new_base_fee + seed
 }
 
-pub async fn make_request(req_url: String) -> Result<reqwest::Response, Error> {
-    reqwest::get(req_url).await
+pub fn access_list_to_ethers(access_list: Vec<(B160, Vec<rU256>)>) -> AccessList {
+    AccessList::from(
+        access_list
+            .into_iter()
+            .map(|(address, slots)| AccessListItem {
+                address: b160_to_h160(address),
+                storage_keys: slots
+                    .into_iter()
+                    .map(|y| H256::from_uint(&ru256_to_u256(y)))
+                    .collect(),
+            })
+            .collect::<Vec<AccessListItem>>(),
+    )
 }
 
-#[derive(BorshDeserialize, Debug)]
-pub struct MintLayout {
-    pub mint_authority_option: u32,
-    pub mint_authority: Pubkey,
-    pub supply: u64,
-    pub decimals: u8,
-    pub is_initialized: bool,
-    pub freeze_authority_option: u32,
-    pub freeze_authority: Pubkey,
+pub fn access_list_to_revm(access_list: AccessList) -> Vec<(B160, Vec<rU256>)> {
+    access_list
+        .0
+        .into_iter()
+        .map(|x| {
+            (
+                h160_to_b160(x.address),
+                x.storage_keys
+                    .into_iter()
+                    .map(|y| u256_to_ru256(y.0.into()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+abigen!(
+    IERC20,
+    r#"[
+        function balanceOf(address) external view returns (uint256)
+    ]"#,
+);
+
+// Utility functions
+
+pub async fn get_token_balance(
+    provider: Arc<Provider<Ws>>,
+    owner: H160,
+    token: H160,
+) -> Result<U256> {
+    let contract = IERC20::new(token, provider);
+    let token_balance = contract.balance_of(owner).call().await?;
+    Ok(token_balance)
+}
+
+pub fn create_new_wallet() -> (LocalWallet, H160) {
+    let wallet = LocalWallet::new(&mut thread_rng());
+    let address = wallet.address();
+    (wallet, address)
+}
+
+pub fn to_h160(str_address: &'static str) -> H160 {
+    H160::from_str(str_address).unwrap()
+}
+
+pub fn is_weth(token_address: H160) -> bool {
+    token_address == to_h160(WETH)
+}
+
+pub fn u256_in_double_u128(value: U256) -> (u128, u128) {
+    let low_u128 = value.low_u128();
+    let high_u128 = (value >> 128).low_u128();
+    return (low_u128, high_u128)
+}
+
+pub fn double_u128_in_u256(u1: u128, u2: u128) -> (U256) {
+    let low_u256 = U256::from(u1);
+    let high_u256 = U256::from(u2) << 128;
+    let newU256 = high_u256 + low_u256;
+    return (newU256)
 }
