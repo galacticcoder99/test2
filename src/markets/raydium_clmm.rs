@@ -1,4 +1,5 @@
-use crate::markets::types::{Dex, DexLabel, Market};
+use crate::markets::types::{Dex, DexLabel, Market, PoolItem};
+use crate::markets::utils::toPairString;
 use tokio::net::TcpStream;
 use std::{fs::File, io::Read};
 use std::fs;
@@ -7,29 +8,30 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 use reqwest::get;
 use log::info;
+use solana_account_decoder::{UiAccountData, UiAccountEncoding};
+use solana_program::pubkey::Pubkey;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_pubsub_client::pubsub_client::PubsubClient;
+use anyhow::Result;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcAccountInfoConfig;
 
+use crate::common::constants::Env;
 
-pub struct PoolItem {
-    mintA: String,
-    mintB: String,
-    vaultA: String,
-    vaultB: String,
-    tradeFeeRate: u128
-}
-
+#[derive(Debug)]
 pub struct RaydiumClmmDEX {
-    dex: Dex,
-    pools: Vec<PoolItem>,
+    pub dex: Dex,
+    pub pools: Vec<PoolItem>,
 }
 impl RaydiumClmmDEX {
-    pub fn new(dex: Dex) -> Self {
+    pub fn new(mut dex: Dex) -> Self {
 
         let mut pools_vec = Vec::new();
         
         let data = fs::read_to_string("src\\markets\\cache\\raydiumclmm-markets.json").expect("LogRocket: error reading file");
         let json_value: Root  = serde_json::from_str(&data).unwrap();
 
-        for pool in json_value.data {
+        for pool in json_value.data.clone() {
             let item: PoolItem = PoolItem {
                 mintA: pool.mint_a.clone(),
                 mintB: pool.mint_b.clone(),
@@ -40,53 +42,31 @@ impl RaydiumClmmDEX {
             pools_vec.push(item);
 
             let market: Market = Market {
-                tokenMintA: pool.mint_a,
-                tokenVaultA: pool.vault_a,
-                tokenMintB: pool.mint_b,
-                tokenVaultB: pool.vault_b,
+                tokenMintA: pool.mint_a.clone(),
+                tokenVaultA: pool.vault_a.clone(),
+                tokenMintB: pool.mint_b.clone(),
+                tokenVaultB: pool.vault_b.clone(),
                 dexLabel: DexLabel::RAYDIUM_CLMM,
-                id: pool.id,
+                fee: pool.amm_config.trade_fee_rate.clone() as u128,
+                id: pool.id.clone(),
+                account_data: None,
             };
+
+            let pair_string = toPairString(pool.mint_a, pool.mint_b);
+            if dex.pairToMarkets.contains_key(&pair_string.clone()) {
+                let vec_market = dex.pairToMarkets.get_mut(&pair_string).unwrap();
+                vec_market.push(market);
+            } else {
+                dex.pairToMarkets.insert(pair_string, vec![market]);
+            }
         }
 
+        info!("Raydium CLMM: {} pools founded", json_value.data.len());
         Self {
             dex: dex,
             pools: pools_vec,
         }
     }
-  //   constructor() {
-  //     super(DexLabel.RAYDIUM_CLMM);
-  //     this.pools = pools.filter((pool) => !MARKETS_TO_IGNORE.includes(pool.id));
-  //     for (const pool of this.pools) {
-  //       this.ammCalcAddPoolMessages.push({
-  //         type: 'addPool',
-  //         payload: {
-  //           poolLabel: this.label,
-  //           id: pool.id,
-  //           feeRateBps: Math.floor(pool.ammConfig.tradeFeeRate / 100),
-  //           serializableAccountInfo: toSerializableAccountInfo(
-  //             initialAccountBuffers.get(pool.id),
-  //           ),
-  //         },
-  //       });
-  
-  //       const market: Market = {
-  //         tokenMintA: pool.mintA,
-  //         tokenVaultA: pool.vaultA,
-  //         tokenMintB: pool.mintB,
-  //         tokenVaultB: pool.vaultB,
-  //         dexLabel: this.label,
-  //         id: pool.id,
-  //       };
-        
-  //       const pairString = toPairString(pool.mintA, pool.mintB);
-  //       if (this.pairToMarkets.has(pairString)) {
-  //         this.pairToMarkets.get(pairString).push(market);
-  //       } else {
-  //         this.pairToMarkets.set(pairString, [market]);
-  //       }
-  //     }
-  //   }
   }
 
 pub async fn fetch_data_raydium_clmm() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,6 +82,42 @@ pub async fn fetch_data_raydium_clmm() -> Result<(), Box<dyn std::error::Error>>
     } else {
         info!("Fetch of 'raydiumclmm-markets.json'  not successful: {}", response.status());
     }
+    Ok(())
+}
+
+pub async fn stream_raydium_clmm(account: Pubkey) -> Result<()> {
+    let env = Env::new();
+    let url = env.wss_rpc_url.as_str();
+    let (mut account_subscription_client, account_subscription_receiver) =
+    PubsubClient::account_subscribe(
+        url,
+        &account,
+        Some(RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::JsonParsed),
+            data_slice: None,
+            commitment: Some(CommitmentConfig::confirmed()),
+            min_context_slot: None,
+        }),
+    )?;
+
+    loop {
+        match account_subscription_receiver.recv() {
+            Ok(response) => {
+                let data = response.value.data;
+                let bytes_slice = UiAccountData::decode(&data).unwrap();
+                println!("account subscription data response: {:?}", data);
+                // let account_data = unpack_from_slice(bytes_slice.as_slice());
+                // println!("Raydium CLMM Pool updated: {:?}", account);
+                // println!("Data: {:?}", account_data.unwrap());
+
+            }
+            Err(e) => {
+                println!("account subscription error: {:?}", e);
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -38,6 +38,13 @@ strum = "0.26.2"
 strum_macros = "0.26.2"
 exitfailure = "0.5.1"
 solana-sdk = "1.18.9"
+solana-client = "1.18.10"
+solana-program = "1.18.10"
+thiserror = "1.0.58"
+hex = "0.4.3"
+solana-account-decoder = "1.18.12"
+solana-pubsub-client = "1.18.12"
+base64 = "0.22.1"
 
 [profile.release]
 codegen-units = 1
